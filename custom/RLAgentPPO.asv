@@ -1,0 +1,217 @@
+classdef RLAgentPPO
+    properties
+        % Neural Networks
+        actor_net
+        critic_net
+        actor_options
+        critic_options
+        
+        % Hyperparameters
+        clip_epsilon = 0.2
+        gamma = 0.99
+        lambda = 0.95
+        learning_rate = 3e-4
+        entropy_coeff = 0.01
+        
+        % Memory Buffer
+        memory_buffer
+        buffer_capacity = 500
+        batch_size = 64
+        current_episode = 1
+        
+        % Tracking
+        total_reward = 0
+        step_count = 0
+    end
+    
+    methods
+        function obj = RLAgentPPO(state_dim, action_dim)
+            % Initialize actor and critic networks
+            obj.actor_net = [
+                featureInputLayer(state_dim, 'Name', 'state_input')
+                fullyConnectedLayer(64, 'Name', 'fc1')
+                reluLayer('Name', 'relu1')
+                fullyConnectedLayer(64, 'Name', 'fc2')
+                reluLayer('Name', 'relu2')
+                fullyConnectedLayer(action_dim, 'Name', 'output')
+                tanhLayer('Name', 'tanh_out') % Output between [-1,1]
+            ];
+            
+            obj.critic_net = [
+                featureInputLayer(state_dim, 'Name', 'state_input')
+                fullyConnectedLayer(64, 'Name', 'fc1')
+                reluLayer('Name', 'relu1')
+                fullyConnectedLayer(64, 'Name', 'fc2')
+                reluLayer('Name', 'relu2')
+                fullyConnectedLayer(1, 'Name', 'output')
+            ];
+            
+            % Initialize training options for MATLAB 2022b
+            obj.actor_options = trainingOptions('adam', ...
+                'InitialLearnRate', obj.learning_rate, ...  % Correct parameter name
+                'GradientDecayFactor', 0.9, ...
+                'SquaredGradientDecayFactor', 0.999, ...
+                'Epsilon', 1e-8);
+            
+            obj.critic_options = trainingOptions('adam', ...
+                'InitialLearnRate', obj.learning_rate, ...  % Correct parameter name
+                'GradientDecayFactor', 0.9, ...
+                'SquaredGradientDecayFactor', 0.999, ...
+                'Epsilon', 1e-8);
+            
+            % Initialize memory buffer
+            obj.memory_buffer = struct(...
+                'states', {}, ...
+                'actions', {}, ...
+                'rewards', {}, ...
+                'next_states', {}, ...
+                'dones', {}, ...
+                'log_probs', {}, ...
+                'values', {}, ...
+                'priority', {});
+        end
+        
+        function [action, log_prob] = get_action(obj, state)
+            % Forward pass through actor network
+            action = predict(obj.actor_net, dlarray(state, 'CB'));
+            action = extractdata(action);
+            
+            % Add exploration noise
+            log_prob = log(normpdf(action, 0, 0.1)); % Simple Gaussian noise
+        end
+        
+        function value = get_value(obj, state)
+            value = predict(obj.critic_net, dlarray(state, 'CB'));
+            value = extractdata(value);
+        end
+        
+        function obj = store_experience(obj, state, action, reward, next_state, done, priority)
+            % Store experience in memory buffer
+            experience = struct(...
+                'state', state, ...
+                'action', action, ...
+                'reward', reward, ...
+                'next_state', next_state, ...
+                'done', done, ...
+                'log_prob', log(normpdf(action, 0, 0.1)), ...
+                'value', obj.get_value(state), ...
+                'priority', priority);
+            
+            if length(obj.memory_buffer) < obj.buffer_capacity
+                obj.memory_buffer = [obj.memory_buffer, experience];
+            else
+                % Replace lowest priority experience
+                [~, idx] = min([obj.memory_buffer.priority]);
+                obj.memory_buffer(idx) = experience;
+            end
+        end
+        
+        function [obj, pid_gains] = update(obj)
+            if length(obj.memory_buffer) < obj.buffer_capacity
+                pid_gains = [1.5, 1.5, 2.0, 8.0, 8.0, 5.0]; % Default gains
+                return;
+            end
+            
+            % Sample batch from memory (prioritized)
+            priorities = [obj.memory_buffer.priority];
+            sampling_probs = priorities / sum(priorities);
+            batch_idx = randsample(1:length(obj.memory_buffer), obj.batch_size, true, sampling_probs);
+            batch = obj.memory_buffer(batch_idx);
+            
+            % Prepare data for training
+            states = cat(2, batch.state);
+            actions = cat(2, batch.action);
+            old_log_probs = cat(2, batch.log_prob);
+            old_values = cat(2, batch.value);
+            rewards = cat(2, batch.reward);
+            next_states = cat(2, batch.next_state);
+            dones = cat(2, batch.done);
+            
+            % Calculate advantages
+            values = obj.get_value(states);
+            next_values = obj.get_value(next_states);
+            deltas = rewards + obj.gamma * next_values .* ~dones - values;
+            advantages = zeros(size(deltas));
+            advantage = 0;
+            for t = length(deltas):-1:1
+                advantage = deltas(t) + obj.gamma * obj.lambda * advantage * ~dones(t);
+                advantages(t) = advantage;
+            end
+            
+            % Normalize advantages
+            advantages = (advantages - mean(advantages)) / (std(advantages) + 1e-8);
+            
+            % Convert to dlarray for training
+            states_dl = dlarray(states, 'CB');
+            actions_dl = dlarray(actions, 'CB');
+            advantages_dl = dlarray(advantages, 'CB');
+            
+            % Train actor
+            actor_loss = @() ppo_actor_loss(obj.actor_net, states_dl, actions_dl, old_log_probs, advantages_dl, obj.clip_epsilon);
+            obj.actor_net = trainnet(states_dl, actions_dl, obj.actor_net, actor_loss, obj.actor_options);
+            
+            % Train critic
+            target_values = old_values + advantages;
+            critic_loss = @() mean(0.5 * (obj.get_value(states) - target_values).^2);
+            obj.critic_net = trainnet(states_dl, target_values, obj.critic_net, critic_loss, obj.critic_options);
+            
+            % Get new PID gains from actor
+            current_state = states(:,1); % Use first state in batch
+            pid_gains = extractdata(predict(obj.actor_net, dlarray(current_state, 'CB')));
+            
+            % Scale gains to reasonable ranges
+            pid_gains = [...
+                1.0 + 0.5 * pid_gains(1), ... % Kp_pos
+                1.0 + 0.5 * pid_gains(2), ...
+                2.0 + 1.0 * pid_gains(3), ...
+                8.0 + 2.0 * pid_gains(4), ... % Kp_att
+                8.0 + 2.0 * pid_gains(5), ...
+                5.0 + 2.0 * pid_gains(6)];
+        end
+        
+        function reward = calculate_reward(obj, error, is_goal_reached, is_moving)
+            % Reward components
+            error_norm = norm(error);
+            threshold = 0.05; % 5% threshold
+            
+            if error_norm < threshold
+                reward = 200; % Large positive reward
+            else
+                reward = -10 * error_norm; % Proportional punishment
+            end
+            
+            % Living penalty
+            if ~is_moving
+                reward = reward - 50;
+            end
+            
+            % Goal reward
+            if is_goal_reached
+                reward = reward + 2000;
+            end
+            
+            % Clip total reward
+            reward = min(reward, 20000);
+        end
+    end
+end
+
+function loss = ppo_actor_loss(net, states, actions, old_log_probs, advantages, clip_epsilon)
+    % Forward pass
+    action_pred = forward(net, states);
+    
+    % Calculate probability ratio
+    new_log_probs = log(normpdf(extractdata(actions), extractdata(action_pred), 0.1));
+    ratios = exp(new_log_probs - old_log_probs);
+    
+    % Clipped surrogate objective
+    surr1 = ratios .* advantages;
+    surr2 = clip(ratios, 1-clip_epsilon, 1+clip_epsilon) .* advantages;
+    policy_loss = -mean(min(surr1, surr2));
+    
+    % Entropy bonus
+    entropy_bonus = -mean(new_log_probs);
+    
+    % Total loss
+    loss = policy_loss + 0.01 * entropy_bonus;
+end
