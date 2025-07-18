@@ -28,7 +28,7 @@ Q = diag(0.01 * ones(12,1));
 R = diag(0.1 * ones(12,1));
 
 % ===== Time Vector =====
-t = 0:dt:40;
+t = 0:dt:10;
 
 % ===== Generate Reference Trajectory =====
 ref.px = sin(pi * t / 500);

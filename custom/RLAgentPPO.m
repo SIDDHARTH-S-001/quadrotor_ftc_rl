@@ -19,6 +19,7 @@ classdef RLAgentPPO
         % Tracking
         total_reward = 0
         step_count = 0
+        training_log = struct('buffer_size', [], 'total_reward', [], 'loss', [])
     end
     
     methods
@@ -46,7 +47,7 @@ classdef RLAgentPPO
             ];
             obj.critic_net = dlnetwork(critic_layers);
             
-            % Initialize memory buffer with empty struct of correct fields
+            % Initialize memory buffer
             obj.memory_buffer = struct(...
                 'state', {}, ...
                 'action', {}, ...
@@ -59,8 +60,9 @@ classdef RLAgentPPO
         end
         
         function [action, log_prob] = get_action(obj, state)
-            % Convert state to correctly formatted dlarray
-            state_dl = dlarray(single(state(:)), 'CB');
+            % Ensure state is column vector and convert to dlarray
+            state = state(:); % Force column vector
+            state_dl = dlarray(single(state'), 'CB'); % Transpose for correct 'CB' format
             
             % Forward pass through actor network
             action = predict(obj.actor_net, state_dl);
@@ -73,7 +75,9 @@ classdef RLAgentPPO
         end
         
         function value = get_value(obj, state)
-            state_dl = dlarray(single(state(:)), 'CB');
+            % Ensure state is column vector and convert to dlarray
+            state = state(:); % Force column vector
+            state_dl = dlarray(single(state'), 'CB'); % Transpose for correct 'CB' format
             value = predict(obj.critic_net, state_dl);
             value = extractdata(value);
         end
@@ -96,11 +100,19 @@ classdef RLAgentPPO
                 [~, idx] = min([obj.memory_buffer.priority]);
                 obj.memory_buffer(idx) = experience;
             end
+            
+            % Update tracking
+            obj.step_count = obj.step_count + 1;
+            obj.total_reward = obj.total_reward + reward;
         end
         
-        function [obj, pid_gains] = update(obj)
+        function [obj, pid_gains, train_metrics] = update(obj)
+            % Initialize empty metrics
+            train_metrics = struct('loss', NaN, 'buffer_size', length(obj.memory_buffer));
+            
             if length(obj.memory_buffer) < obj.buffer_capacity
                 pid_gains = [1.5, 1.5, 2.0, 8.0, 8.0, 5.0]; % Default gains
+                fprintf('Buffer filling: %d/%d\n', length(obj.memory_buffer), obj.buffer_capacity);
                 return;
             end
             
@@ -108,18 +120,20 @@ classdef RLAgentPPO
             batch_idx = randperm(length(obj.memory_buffer), min(obj.batch_size, length(obj.memory_buffer)));
             batch = obj.memory_buffer(batch_idx);
             
-            % Prepare data with correct dimensions
-            states = [batch.state];
-            states_dl = dlarray(single(states), 'CB');
-            
+            % Prepare data with proper dimensions
+            states = cat(2, batch.state); % Concatenate states horizontally
             actions = [batch.action];
             old_values = [batch.value];
             rewards = [batch.reward];
-            next_states = [batch.next_state];
+            next_states = cat(2, batch.next_state);
             dones = [batch.done];
             
             % Calculate advantages
-            next_values = arrayfun(@(s) obj.get_value(s), num2cell(next_states,1));
+            next_values = zeros(1, size(next_states,2));
+            for i = 1:size(next_states,2)
+                next_values(i) = obj.get_value(next_states(:,i));
+            end
+            
             deltas = rewards + obj.gamma * next_values .* ~dones - old_values;
             
             advantages = zeros(size(deltas));
@@ -129,6 +143,15 @@ classdef RLAgentPPO
                 advantages(t) = advantage;
             end
             advantages = (advantages - mean(advantages)) / (std(advantages) + 1e-8);
+            
+            % Calculate loss
+            states_dl = dlarray(single(states), 'CB'); % Proper batch format
+            current_values = predict(obj.critic_net, states_dl);
+            value_loss = mean(0.5 * (extractdata(current_values) - (old_values + advantages)').^2);
+            
+            % Store training metrics
+            train_metrics.loss = value_loss;
+            train_metrics.buffer_size = length(obj.memory_buffer);
             
             % Get current PID gains
             current_state = states(:,1);
@@ -140,6 +163,10 @@ classdef RLAgentPPO
                 8.0 + 2.0 * pid_gains(4), ... % Kp_att
                 8.0 + 2.0 * pid_gains(5), ...
                 5.0 + 2.0 * pid_gains(6)];
+            
+            % Display training progress
+            fprintf('Training - Loss: %.4f | Buffer: %d/%d | Avg Reward: %.2f\n', ...
+                value_loss, length(obj.memory_buffer), obj.buffer_capacity, mean(rewards));
         end
         
         function reward = calculate_reward(obj, error, is_goal_reached, is_moving)
@@ -161,6 +188,24 @@ classdef RLAgentPPO
             end
             
             reward = min(reward, 20000);
+        end
+        
+        function print_progress(obj, episode)
+            fprintf('\n=== Episode %d Summary ===\n', episode);
+            fprintf('Total Steps: %d\n', obj.step_count);
+            fprintf('Total Reward: %.2f\n', obj.total_reward);
+            fprintf('Memory Buffer: %d/%d (%.1f%%)\n', ...
+                length(obj.memory_buffer), obj.buffer_capacity, ...
+                100*length(obj.memory_buffer)/obj.buffer_capacity);
+            
+            if length(obj.memory_buffer) >= obj.buffer_capacity
+                fprintf('Training Active\n');
+                if ~isempty(obj.training_log.loss)
+                    fprintf('Recent Loss: %.4f\n', obj.training_log.loss(end));
+                end
+            else
+                fprintf('Collecting Experiences...\n');
+            end
         end
     end
 end
