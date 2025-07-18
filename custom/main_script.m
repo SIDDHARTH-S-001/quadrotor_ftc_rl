@@ -31,7 +31,13 @@ R = diag(0.1 * ones(12,1));  % Measurement noise covariance
 t = 0:dt:10; % 0 to 10s
 
 % ===== Generate Reference Trajectory =====
-ref = generate_reference(t);
+ref.px = sin(pi * t / 500); % X-position
+ref.py = sin(pi * t / 500); % Y-position
+ref.pz = ones(size(t));     % Z-position (constant height)
+ref.vx = (pi/500) * cos(pi * t / 500); % X-velocity
+ref.vy = (pi/500) * cos(pi * t / 500); % Y-velocity
+ref.vz = zeros(size(t));    % Z-velocity
+ref.yaw = zeros(size(t));   % Yaw angle (0° as in paper)
 
 % ===== Initialize State and Covariance =====
 x_true = [ref.px(1); ref.py(1); ref.pz(1); ... % Initial position
@@ -48,21 +54,30 @@ error_history = zeros(length(t), 6);
 for i = 1:length(t)
     % Simulate sensor measurements (add noise)
     y = x_true + sqrt(R) * randn(12,1);
-
+    
     % Kalman Filter
     [x_est, P] = kalman_filter(y, x_est, P, A, H, Q, R);
-
-    % Calculate error
-    error = calculate_error(ref, x_est);
+    
+    % Calculate error (pass current time index 'i')
+    error.position = [ref.px(i) - x_est(1);   % X-error
+                     ref.py(i) - x_est(2);    % Y-error
+                     ref.pz(i) - x_est(3)];   % Z-error
+    error.attitude = [0 - x_est(7);           % Roll error
+                     0 - x_est(8);            % Pitch error
+                     ref.yaw(i) - x_est(9)];  % Yaw error
     error_history(i,:) = [error.position; error.attitude];
-
-    % PID Controller
-    u = pid_controller(ref, x_est, params, gains, dt);
-
+    
+    % PID Controller (modified to accept time index 'i')
+    current_ref.px = ref.px(i);
+    current_ref.py = ref.py(i);
+    current_ref.pz = ref.pz(i);
+    current_ref.yaw = ref.yaw(i);
+    u = pid_controller(current_ref, x_est, params, gains, dt);
+    
     % Update true state (using quadrotor_model)
     [~, x_temp] = ode45(@(t,x) quadrotor_model(t, x, u, params), [0, dt], x_true);
     x_true = x_temp(end,:)';
-
+    
     % Store history
     x_history(i,:) = x_true';
 end
