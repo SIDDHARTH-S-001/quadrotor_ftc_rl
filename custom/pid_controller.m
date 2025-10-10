@@ -1,61 +1,53 @@
-function [u] = pid_controller(ref, x_est, params, gains, dt)
+function u = pid_controller(ref, x_est, params, gains, dt)
     % PID Controller for Quadrotor
-    % Inputs:
-    %   ref: reference trajectory (struct with px, py, pz, yaw)
-    %   x_est: estimated state from Kalman filter [px, py, pz, vx, vy, vz, phi, theta, psi, p, q, r]
-    %   params: system parameters (mass, gravity, etc.)
-    %   gains: struct with PID gains (Kp, Ki, Kd for position and attitude)
-    %   dt: time step
-    % Output:
-    %   u: control inputs [tau1, tau2, tau3, tau4]
+    % ref:   struct with px,py,pz,yaw (scalars)
+    % x_est: 12×1 [px;py;pz; vx;vy;vz; phi;theta;psi; p;q;r]
+    % dt:    timestep
 
-    % Initialize persistent variables for integral and derivative terms
-    persistent integral_error prev_error;
-    if isempty(integral_error)
-        integral_error = zeros(6, 1); % [x, y, z, phi, theta, psi]
-        prev_error = zeros(6, 1);
+    persistent Ierr Perr
+    if isempty(Ierr)
+        Ierr = zeros(6,1);    % [ex; ey; ez; ephi; etheta; eyaw]
+        Perr = zeros(6,1);
     end
 
-    % Extract estimated states
-    px_est = x_est(1); py_est = x_est(2); pz_est = x_est(3);
-    phi_est = x_est(7); theta_est = x_est(8); psi_est = x_est(9);
+    %--- Extract estimated states ---
+    px    = x_est(1); 
+    py    = x_est(2); 
+    pz    = x_est(3);
+    phi   = x_est(7); 
+    theta = x_est(8); 
+    psi   = x_est(9);
 
-    % Calculate errors
-    error = [ref.px - px_est;
-             ref.py - py_est;
-             ref.pz - pz_est;
-             0 - phi_est;      % Reference roll is 0
-             0 - theta_est;    % Reference pitch is 0
-             ref.yaw - psi_est]; % Reference yaw
+    %--- Compute error vector [pos; attitude] ---
+    err = [ ref.px    - px;
+            ref.py    - py;
+            ref.pz    - pz;
+            0         - phi;   % desired roll = 0
+            0         - theta; % desired pitch = 0
+            ref.yaw   - psi ];
 
-    % Update integral and derivative terms
-    integral_error = integral_error + error * dt;
-    derivative_error = (error - prev_error) / dt;
-    prev_error = error;
+    %--- Integrator & derivative terms ---
+    Ierr = Ierr + err * dt;
+    Derr = (err - Perr) / dt;
+    Perr = err;
 
-    % PID Control (position and attitude)
-    % Position control (outer loop)
-    F_des = gains.Kp_pos(1:3) .* error(1:3) + ...
-             gains.Ki_pos(1:3) .* integral_error(1:3) + ...
-             gains.Kd_pos(1:3) .* derivative_error(1:3);
+    %--- Outer loop: desired total force in body-z ---
+    Fdes = gains.Kp_pos(:) .* err(1:3) + ...
+           gains.Ki_pos(:) .* Ierr(1:3) + ...
+           gains.Kd_pos(:) .* Derr(1:3);
 
-    % Attitude control (inner loop)
-    tau_phi = gains.Kp_att(1) * error(4) + gains.Ki_att(1) * integral_error(4) + gains.Kd_att(1) * derivative_error(4);
-    tau_theta = gains.Kp_att(2) * error(5) + gains.Ki_att(2) * integral_error(5) + gains.Kd_att(2) * derivative_error(5);
-    tau_psi = gains.Kp_att(3) * error(6) + gains.Ki_att(3) * integral_error(6) + gains.Kd_att(3) * derivative_error(6);
+    %--- Inner loop: attitude torques ---
+    tau_phi   = gains.Kp_att(1)*err(4) + gains.Ki_att(1)*Ierr(4) + gains.Kd_att(1)*Derr(4);
+    tau_theta = gains.Kp_att(2)*err(5) + gains.Ki_att(2)*Ierr(5) + gains.Kd_att(2)*Derr(5);
+    tau_psi   = gains.Kp_att(3)*err(6) + gains.Ki_att(3)*Ierr(6) + gains.Kd_att(3)*Derr(6);
 
-    % Total thrust (tau4) is mg + F_des_z (compensate gravity)
-    tau4 = params.m * params.g + F_des(3);
+    %--- Thrust (body-z) with gravity compensation ---
+    T = params.m * params.g + Fdes(3);
+    T = max(0, T);  % prevent negative thrust
 
-    % Convert desired forces to roll/pitch commands (simplified)
-    phi_des = (F_des(1) * sin(psi_est) - F_des(2) * cos(psi_est)) / tau4;
-    theta_des = (F_des(1) * cos(psi_est) + F_des(2) * sin(psi_est)) / tau4;
-
-    % Attitude control inputs (tau1, tau2, tau3)
-    tau1 = (phi_des - phi_est) * params.Ix;
-    tau2 = (theta_des - theta_est) * params.Iy;
-    tau3 = tau_psi * params.Iz;
-
-    % Saturation (optional, to limit control inputs)
-    u = [tau1; tau2; tau3; tau4];
+    %--- Return control inputs [tau_roll; tau_pitch; tau_yaw; thrust] ---
+    u = [ tau_phi;
+          tau_theta;
+          tau_psi;
+          T ];
 end
