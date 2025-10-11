@@ -1,0 +1,298 @@
+function pid_tuning_and_control_test()
+% TEST_PID_BASELINE
+% 1) Uses mathematical_model & baseline_waypoint to follow a straight line
+%    with a working PID controller.
+% 2) Tunes PID gains robustly with pid_gains_estimator.
+% 3) Compares performance with/without PID in the presence of wind
+%    (small white Gaussian noise on velocity).
+% Also exercises PID tuning/controller failure modes: sampling cap, actuator
+% authority scaling, integrator enable/disable, actuator saturation, and rate limit.
+
+%% ------------------------------------------------------------------------
+%  SETUP
+% -------------------------------------------------------------------------
+rng(1);
+
+% Plant & controller timing
+dt    = 0.02;            % 50 Hz
+T     = 15.0;            % total time
+N     = round(T/dt);
+
+% Plant params
+m     = 1.0;             % kg
+Iz    = 0.02;            % kg*m^2
+kf    = 8.0;             % N per unit command (high-level gain)
+km    = 0.15;            % N*m per unit command
+posB  = [20 20];         % position bounds for termination
+velB  = 10;              % velocity bound
+
+% Bundle plant into a struct to pass to subfunctions
+plant = struct('m', m, 'Iz', Iz, 'kf', kf, 'km', km);
+
+% Waypoint config (straight line)
+cfg_wp = struct('P0',[0 0], 'P1',[12 6], ...
+                'mode','param', 'v_ref', 0.9);
+
+% Controller limits / rate limit
+u_min = 0; u_max = 1; u_rate = 0.05;  % 5%/step
+
+% Tolerance band for metrics (cross-track)
+delta = 0.25;  % meters
+
+% Wind (WGN) standard deviation on velocity increments [m/s] per step
+wind_sigma = 0.05;  % small
+
+% Initial state
+s0 = [0 0 0 0 0 0];
+
+%% ------------------------------------------------------------------------
+%  GAIN TUNING (Robust PD+I with checks)
+% -------------------------------------------------------------------------
+% CASE A: Nominal desired dynamics
+optsA = struct('tr_xy',0.8,'tr_yaw',0.5,'zeta_xy',0.9,'zeta_yaw',0.9, ...
+               'u_min',u_min,'u_max',u_max,'enable_integral',true);
+
+[G_A, infoA] = pid_gains_estimator(m, Iz, dt, kf, km, optsA);
+fprintf('[Nominal] wn_xy=%.2f, wn_yaw=%.2f, Ki status: %s\n', infoA.wn_xy, infoA.wn_yaw, infoA.Ki_status);
+if infoA.sampling_cap_xy || infoA.sampling_cap_yaw
+    warning('Nominal tuning hit sampling cap; consider slower rise times.');
+end
+if infoA.scaled_for_authority
+    warning('Nominal tuning scaled down due to actuator authority.');
+end
+
+% CASE B: Aggressive targets to trigger failure checks (sampling/authority)
+optsB = struct('tr_xy',0.15,'tr_yaw',0.12,'zeta_xy',1.0,'zeta_yaw',1.0, ...
+               'u_min',u_min,'u_max',u_max,'enable_integral',true);
+[G_B, infoB] = pid_gains_estimator(m, Iz, dt, kf, km, optsB);
+fprintf('[Aggressive] wn_xy=%.2f, wn_yaw=%.2f, Ki status: %s\n', infoB.wn_xy, infoB.wn_yaw, infoB.Ki_status);
+if infoB.sampling_cap_xy || infoB.sampling_cap_yaw
+    fprintf('  -> Sampling cap engaged (expected in aggressive case).\n');
+end
+if infoB.scaled_for_authority
+    fprintf('  -> Authority scaling engaged (expected in aggressive case).\n');
+end
+
+% We'll use the safer nominal G_A for the main runs.
+ctrl_params = struct( ...
+    'dt',dt,'kf',kf,'km',km, ...
+    'Kpx',G_A.Kpx,'Kix',G_A.Kix,'Kdx',G_A.Kdx, ...
+    'Kpy',G_A.Kpy,'Kiy',G_A.Kiy,'Kdy',G_A.Kdy, ...
+    'Kppsi',G_A.Kppsi,'Kipsi',G_A.Kipsi,'Kdpsi',G_A.Kdpsi, ...
+    'Imax',[2 2 1], ...
+    'u_min',u_min,'u_max',u_max,'u_rate',u_rate);
+
+%% ------------------------------------------------------------------------
+%  SCENARIO 1: PID ON, NO WIND  (baseline tracking)
+% -------------------------------------------------------------------------
+fprintf('\nScenario 1: PID ON, NO WIND\n');
+% res1 = run_scenario(s0, cfg_wp, ctrl_params, 'pid_on', false, wind_sigma, posB, velB, dt, N, delta);
+res1 = run_scenario(s0, cfg_wp, ctrl_params, 'pid_on', false, wind_sigma, posB, velB, dt, N, delta, plant);
+
+%% ------------------------------------------------------------------------
+%  SCENARIO 2: PID ON, WITH WIND
+% -------------------------------------------------------------------------
+fprintf('Scenario 2: PID ON, WITH WIND\n');
+% res2 = run_scenario(s0, cfg_wp, ctrl_params, 'pid_on', true, wind_sigma, posB, velB, dt, N, delta);
+res2 = run_scenario(s0, cfg_wp, ctrl_params, 'pid_on', true,  wind_sigma, posB, velB, dt, N, delta, plant);
+
+%% ------------------------------------------------------------------------
+%  SCENARIO 3: NO PID (open loop), WITH WIND
+%   Here we purposely disable the controller (u=0.5 or 0?), to show drift.
+%   We'll use u=zeros to highlight disturbance sensitivity.
+% -------------------------------------------------------------------------
+fprintf('Scenario 3: NO PID, WITH WIND\n');
+% res3 = run_scenario(s0, cfg_wp, ctrl_params, 'pid_off', true, wind_sigma, posB, velB, dt, N, delta);
+
+%% ------------------------------------------------------------------------
+%  PLOTS / METRICS
+% -------------------------------------------------------------------------
+plot_results(res1, res2, res3, cfg_wp, delta);
+
+fprintf('\n=== Summary Metrics ===\n');
+disp_table('Scenario',{'PID(no wind)','PID(wind)','No PID(wind)'}, ...
+    '% time |e⊥|≤δ',[res1.frac_in_tol*100, res2.frac_in_tol*100, res3.frac_in_tol*100], ...
+    'Avg |e⊥|',[res1.mean_abs_eperp, res2.mean_abs_eperp, res3.mean_abs_eperp], ...
+    'Max |e⊥|',[res1.max_abs_eperp, res2.max_abs_eperp, res3.max_abs_eperp], ...
+    'Saturated % steps',[res1.sat_frac*100, res2.sat_frac*100, res3.sat_frac*100]);
+
+fprintf('\nFailure-mode checks exercised:\n');
+fprintf('  * Tuning sampling cap?  Aggressive: xy=%d yaw=%d\n', infoB.sampling_cap_xy, infoB.sampling_cap_yaw);
+fprintf('  * Tuning authority scaling? Aggressive: %d\n', infoB.scaled_for_authority);
+fprintf('  * Integral enabled/disabled? Nominal: %s | Aggressive: %s\n', infoA.Ki_status, infoB.Ki_status);
+fprintf('  * Controller saturation observed (PID, wind): %.1f%% of steps\n', res2.sat_frac*100);
+if res1.terminated || res2.terminated || res3.terminated
+    fprintf('  * Terminations occurred: [S1=%d S2=%d S3=%d] Reasons: %s | %s | %s\n', ...
+        res1.terminated, res2.terminated, res3.terminated, res1.term_reason, res2.term_reason, res3.term_reason);
+else
+    fprintf('  * No safety terminations triggered.\n');
+end
+
+end % main
+
+
+%% ========================================================================
+function res = run_scenario(s0, cfg_wp, ctrl_params, mode, wind_on, wind_sigma, posB, velB, dt, N, delta)
+% Simulates one scenario with/without PID and wind.
+s = s0; ctrl = struct(); ctx_wp = struct();
+
+% For controller saturation stats
+sat_count = 0;
+
+% Logs
+t  = (0:N-1)' * dt;
+S  = zeros(N,6);     % states
+U  = zeros(N,4);     % motor commands
+Ref= zeros(N,3);     % [x*, y*, psi*]
+E  = zeros(N,1);     % cross-track error
+Term = false; reason = "";
+
+% Precompute line normal for cross-track distance
+P0 = cfg_wp.P0(:)'; P1 = cfg_wp.P1(:)';
+d  = P1 - P0; L = max(hypot(d(1),d(2)), 1e-12);
+d_hat = d / L;
+n_hat = [ -d_hat(2), d_hat(1) ]; % left-normal
+
+for k = 1:N
+    % Reference
+    [ref, ctx_wp] = baseline_waypoint(t(k), cfg_wp, ctx_wp, s(1:2));
+    Ref(k,:) = [ref.x, ref.y, ref.psi];
+    % Cross-track (signed)
+    p_rel = [s(1) s(2)] - P0;
+    e_perp = dot(p_rel, n_hat);
+    E(k) = e_perp;
+
+    % Controller
+    switch mode
+        case 'pid_on'
+            [u, ctrl, diag] = pid_controller(s, ref, ctrl, ctrl_params);
+        otherwise % 'pid_off'
+            u = zeros(1,4); % no actuation
+            diag = struct('u_pre',u,'u_clip',u); 
+    end
+
+    % Count saturation
+    if any(u <= ctrl_params.u_min + 1e-6 | u >= ctrl_params.u_max - 1e-6)
+        sat_count = sat_count + 1;
+    end
+
+    % Plant step
+%     model_params = struct('m',safep(os(m=1)), 'kf',safep(os(kf=1)), 'km',safep(os(km=1)), 'Iz',safep(os(Iz=1)), ...
+%                           'dt',dt, 'integrator','euler', ...
+%                           'u_rate',ctrl_params.u_rate, 'last_u',ctrl.last_u, ...
+%                           'pos_bound',posB, 'vel_bound',velB);
+    model_params = struct( ...
+                            'm', m, 'kf', kf, 'km', km, 'Iz', Iz, ...
+                            'dt', dt, 'integrator','euler', ...
+                            'u_rate', ctrl_params.u_rate, 'last_u', ctrl.last_u, ...
+                            'pos_bound', posB, 'vel_bound', velB);
+    model_params.m  = evalin('caller','m'); 
+    model_params.kf = evalin('caller','kf'); 
+    model_params.km = evalin('caller','km'); 
+    model_params.Iz = evalin('caller','Iz'); 
+
+    [s_next, out] = mathematical_model(s, u, model_params);
+
+    % Inject wind as WGN on velocity states (process noise)
+    if wind_on
+        s_next(3:4) = s_next(3:4) + wind_sigma * randn(1,2);
+    end
+
+    % Termination check from model
+    if out.terminated
+        Term = true; reason = out.term_reason;
+        % Freeze logs beyond this point
+        S(k:end,:) = repmat(s_next, N-k+1, 1);
+        U(k,:)     = u;
+        Ref(k,:)   = [ref.x, ref.y, ref.psi];
+        break;
+    end
+
+    % Log and continue
+    S(k,:) = s_next;
+    U(k,:) = u;
+    s = s_next;
+
+    % End early if reached final reference and nearly stopped (PID on)
+    if strcmp(mode,'pid_on') && ref.done && norm(s(3:4)) < 0.05 && abs(e_perp) < delta
+        % keep running to fill logs; or could break
+    end
+end
+
+% If not terminated, fill remaining logs
+if ~Term && k < N
+    S(k+1:end,:) = repmat(S(k,:), N-k, 1);
+    U(k+1:end,:) = repmat(U(k,:), N-k, 1);
+    Ref(k+1:end,:)= repmat(Ref(k,:), N-k, 1);
+end
+
+% Metrics
+in_tol = abs(E) <= delta;
+frac_in_tol = mean(in_tol(~isnan(in_tol)));
+mean_abs_e  = mean(abs(E),'omitnan');
+max_abs_e   = max(abs(E),[],'omitnan');
+sat_frac    = sat_count / N;
+
+res = struct('t',t,'S',S,'U',U,'Ref',Ref,'E',E, ...
+             'frac_in_tol',frac_in_tol,'mean_abs_eperp',mean_abs_e,'max_abs_eperp',max_abs_e, ...
+             'sat_frac',sat_frac,'terminated',Term,'term_reason',string(reason), ...
+             'mode',mode,'wind_on',wind_on,'delta',delta);
+end
+
+
+%% ========================================================================
+function plot_results(res1, res2, res3, cfg_wp, delta)
+% Trajectory
+figure('Name','Trajectory'); hold on; grid on; axis equal
+% tolerance band lines (offsets)
+P0 = cfg_wp.P0(:)'; P1 = cfg_wp.P1(:)'; d = P1-P0; L = hypot(d(1),d(2)); d_hat = d/max(L,1e-12);
+n_hat = [-d_hat(2), d_hat(1)];
+plot([P0(1) P1(1)], [P0(2) P1(2)], 'k--', 'LineWidth',1.5);
+plot([P0(1) P1(1)] + delta*n_hat(1), [P0(2) P1(2)] + delta*n_hat(2), 'k:');
+plot([P0(1) P1(1)] - delta*n_hat(1), [P0(2) P1(2)] - delta*n_hat(2), 'k:');
+
+plot(res1.S(:,1), res1.S(:,2), 'LineWidth',1.5);
+plot(res2.S(:,1), res2.S(:,2), 'LineWidth',1.5);
+plot(res3.S(:,1), res3.S(:,2), 'LineWidth',1.5);
+legend('Path','Tol+','Tol-','PID no wind','PID + wind','No PID + wind','Location','best');
+xlabel('x [m]'); ylabel('y [m]'); title('2D Trajectory');
+
+% Cross-track error
+figure('Name','Cross-track error'); hold on; grid on
+plot(res1.t, res1.E, 'LineWidth',1.2);
+plot(res2.t, res2.E, 'LineWidth',1.2);
+plot(res3.t, res3.E, 'LineWidth',1.2);
+yline(delta,'k:'); yline(-delta,'k:');
+xlabel('t [s]'); ylabel('e_\perp [m]');
+legend('PID no wind','PID + wind','No PID + wind','\pm \delta'); title('Cross-track error');
+
+% Motor commands
+figure('Name','Motor commands (PID + wind)'); 
+plot(res2.t, res2.U, 'LineWidth',1.0); grid on
+ylim([-0.1 1.1]); xlabel('t [s]'); ylabel('u_i');
+legend('u1','u2','u3','u4','Location','best'); title('Motor commands (Scenario 2)');
+
+end
+
+
+%% ========================================================================
+function disp_table(header, names, varargin)
+% Small helper to print a compact table
+% varargin pairs: label, data_vector
+cols = 1 + numel(varargin)/2;
+wname = max(cellfun(@numel,names))+2;
+fprintf('\n%-*s', wname, header);
+labels = varargin(1:2:end);
+for i=1:numel(labels)
+    fprintf('%16s', labels{i});
+end
+fprintf('\n');
+for r=1:numel(names)
+    fprintf('%-*s', wname, names{r});
+    for c=1:2:numel(varargin)
+        v = varargin{c+1};
+        fprintf('%16.3f', v(r));
+    end
+    fprintf('\n');
+end
+end
