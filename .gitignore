@@ -1,0 +1,21 @@
+# Data types
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.mp4
+*.avi
+
+# System files
+*.csv
+*.xls
+*.xlsx
+*.doc
+*.docx
+
+# Temporary files
+*.tmp
+*.log
+*.__pycache__
